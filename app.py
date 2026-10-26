@@ -3,9 +3,13 @@
 # Chạy: WEB_USER=admin WEB_PASS=matkhau python3 app.py   (mở http://localhost:5000)
 import io, json, os, secrets, threading, time
 import paramiko
+import redis
 from flask import Flask, jsonify, request, Response
 
-DATA = "servers.json"
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+REDIS_KEY = "sshkeeper:servers"  # hash: id -> json(cfg)
+rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
 WEB_USER = os.environ.get("WEB_USER", "admin")
 WEB_PASS = os.environ.get("WEB_PASS") or secrets.token_urlsafe(8)
 lock = threading.Lock()
@@ -14,17 +18,15 @@ app = Flask(__name__)
 
 
 def load():
-    try:
-        with open(DATA) as f:
-            return json.load(f)
-    except Exception:
-        return []
+    return [json.loads(v) for v in rdb.hgetall(REDIS_KEY).values()]
 
 
-def save(items):
-    with open(DATA, "w") as f:
-        json.dump(items, f, indent=2)
-    os.chmod(DATA, 0o600)
+def save_one(cfg):
+    rdb.hset(REDIS_KEY, cfg["id"], json.dumps(cfg))
+
+
+def delete_one(sid):
+    rdb.hdel(REDIS_KEY, sid)
 
 
 def load_key(text, passphrase):
@@ -62,8 +64,26 @@ class Worker(threading.Thread):
                 client.connect(**kw)
                 t = client.get_transport()
                 t.set_keepalive(15)
+
+                chan = None
+                env_pairs = []
+                for line in (c.get("env") or "").splitlines():
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env_pairs.append((k.strip(), v.strip()))
+                if env_pairs:
+                    # Mô phỏng `ssh -o SetEnv=...`: mở 1 session, set biến môi
+                    # trường rồi giữ session đó sống (giống container segfault.net)
+                    chan = t.open_session()
+                    for k, v in env_pairs:
+                        chan.set_environment_variable(k, v)
+                    chan.get_pty()
+                    chan.invoke_shell()
+
                 self.status, self.since = "Online", time.time()
-                while not self.stop.is_set() and t.is_active():
+                while not self.stop.is_set() and t.is_active() and (chan is None or not chan.closed):
                     try:
                         t.send_ignore()
                     except Exception:
@@ -71,6 +91,11 @@ class Worker(threading.Thread):
                     self.stop.wait(15)
                 if not self.stop.is_set():
                     self.status = "Mất kết nối"
+                if chan is not None:
+                    try:
+                        chan.close()
+                    except Exception:
+                        pass
             except Exception as e:
                 self.status = "Lỗi: " + str(e)[:120]
             finally:
@@ -118,11 +143,9 @@ def api_add():
         return jsonify(error="Cần mật khẩu hoặc private key"), 400
     cfg = dict(id=secrets.token_hex(4), name=d.get("name", "").strip() or host, host=host,
                port=int(d.get("port") or 22), user=user, password=d.get("password", ""),
-               key=d.get("key", "").strip())
+               key=d.get("key", "").strip(), env=d.get("env", "").strip())
     with lock:
-        items = load()
-        items.append(cfg)
-        save(items)
+        save_one(cfg)
     start(cfg)
     return jsonify(ok=True)
 
@@ -130,7 +153,7 @@ def api_add():
 @app.post("/api/delete/<sid>")
 def api_delete(sid):
     with lock:
-        save([c for c in load() if c["id"] != sid])
+        delete_one(sid)
     w = workers.pop(sid, None)
     if w:
         w.stop.set()
@@ -156,6 +179,7 @@ small{color:#666}#msg{color:#dc2626}
 <input id="user" placeholder="User">
 <input id="password" type="password" placeholder="Mật khẩu (hoặc passphrase của key)">
 <textarea id="key" rows="4" placeholder="Private key (để trống nếu dùng mật khẩu)"></textarea>
+<textarea id="env" rows="2" placeholder="Biến môi trường SetEnv, mỗi dòng 1 cái, VD: SECRET=xxxxx"></textarea>
 <button onclick="add()">Thêm</button> <span id="msg"></span></div>
 <div class="box"><b>Danh sách</b><div id="list">Đang tải...</div></div>
 <script>
@@ -178,10 +202,10 @@ async function load(){
   }
 }
 async function add(){
-  const body={};for(const k of ["name","host","port","user","password","key"])body[k]=$(k).value;
+  const body={};for(const k of ["name","host","port","user","password","key","env"])body[k]=$(k).value;
   const r=await fetch("/api/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const j=await r.json();$("msg").textContent=j.error||"";
-  if(r.ok){for(const k of ["name","host","user","password","key"])$(k).value="";load()}
+  if(r.ok){for(const k of ["name","host","user","password","key","env"])$(k).value="";load()}
 }
 load();setInterval(load,3000);
 </script></body></html>"""
@@ -196,4 +220,4 @@ if __name__ == "__main__":
     for cfg in load():
         start(cfg)
     print(f"\n>>> Đăng nhập web: {WEB_USER} / {WEB_PASS}\n")
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), threaded=True)

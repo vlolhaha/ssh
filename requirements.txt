@@ -1,2 +1,4 @@
 Flask>=3.0
 paramiko>=3.4
+redis>=5.0
+
